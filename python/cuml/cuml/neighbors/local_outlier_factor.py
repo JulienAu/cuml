@@ -2,130 +2,226 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-
-"""Local Outlier Factor for GPU-accelerated anomaly detection."""
+import warnings
+from numbers import Real
 
 import cupy as cp
+from sklearn.utils.metaestimators import available_if
 
-from cuml.internals.base import Base
 from cuml.internals.outputs import ReflectedAttr, mlfunc
-from cuml.internals.validation import check_inputs, check_is_fitted
-from cuml.neighbors.nearest_neighbors import NearestNeighbors
-
-# Matches the constant scikit-learn adds to local reachability densities to
-# avoid dividing by zero on duplicated training points.
-_LRD_EPS = 1e-10
+from cuml.internals.validation import check_is_fitted
+from cuml.neighbors.nearest_neighbors import NeighborsBase
 
 
-class LocalOutlierFactor(Base):
-    """Unsupervised outlier detection using the Local Outlier Factor.
+def _novelty_enabled(model):
+    if not model.novelty:
+        raise AttributeError(
+            "predict, decision_function and score_samples are only available "
+            "when novelty=True. Use fit_predict to label the training data."
+        )
+    return True
 
-    The anomaly score of each sample measures how isolated it is from its
-    neighborhood: the local reachability density of a sample is compared to
-    the densities of its ``n_neighbors`` nearest neighbors, and samples with
-    a substantially lower density are considered outliers.
 
-    The nearest-neighbor search runs on GPU through
-    :class:`cuml.neighbors.NearestNeighbors`; the factor computation is
-    vectorized post-processing of the returned distances and indices.
+def _novelty_disabled(model):
+    if model.novelty:
+        raise AttributeError(
+            "fit_predict is only available when novelty=False. Use predict "
+            "to label new data."
+        )
+    return True
+
+
+class LocalOutlierFactor(NeighborsBase):
+    """
+    Unsupervised outlier detection using the Local Outlier Factor (LOF).
+
+    The anomaly score of each sample is called the Local Outlier Factor. It
+    measures the local deviation of the density of a given sample with
+    respect to its neighbors. The local density is estimated from the
+    distances to the ``n_neighbors`` nearest neighbors, and samples that have
+    a substantially lower density than their neighbors are considered
+    outliers.
 
     Parameters
     ----------
-    n_neighbors : int, default=20
-        Number of neighbors to use for the density estimate. Clamped to
-        ``n_samples - 1`` when the training set is smaller.
-    metric : str, default="euclidean"
-        Distance metric, forwarded to
-        :class:`cuml.neighbors.NearestNeighbors`. Only metrics supported by
-        the underlying nearest-neighbor primitive are available.
-    p : int, default=2
-        Parameter of the Minkowski metric when ``metric="minkowski"``.
-    contamination : "auto" or float, default="auto"
-        The expected proportion of outliers, used to set ``offset_``.
-        ``"auto"`` uses the original paper's threshold of -1.5; a float in
-        (0, 0.5] sets the threshold at the matching quantile of the training
-        scores.
-    novelty : bool, default=False
-        When False (outlier detection), only ``fit_predict`` and the fitted
-        attributes are available. When True (novelty detection),
-        ``predict``, ``decision_function`` and ``score_samples`` operate on
-        new data and ``fit_predict`` is unavailable, matching scikit-learn.
+    n_neighbors : int (default=20)
+        Number of neighbors to use. If it is larger than the number of
+        samples provided, all other samples are used.
+    algorithm : string (default='auto')
+        The query algorithm to use, see
+        :class:`~cuml.neighbors.NearestNeighbors` for the valid options.
+    metric : string (default='euclidean')
+        Distance metric to use, see :class:`~cuml.neighbors.NearestNeighbors`
+        for the supported metrics of each algorithm.
+    p : float (default=2)
+        Parameter for the Minkowski metric. When p = 1, this is equivalent to
+        manhattan distance (l1), and euclidean distance (l2) for p = 2. For
+        arbitrary p, minkowski distance (lp) is used.
+    algo_params : dict, optional (default=None)
+        Used to configure the nearest neighbor algorithm to be used, see
+        :class:`~cuml.neighbors.NearestNeighbors`.
+    metric_params : dict, optional (default = None)
+        Additional keyword arguments for the metric function.
+    contamination : 'auto' or float (default='auto')
+        The proportion of outliers in the data set, used to define the
+        threshold on the scores of the samples.
+
+        - if ``'auto'``, the threshold is determined as in the original
+          paper (``offset_ = -1.5``).
+        - if a float, it should be in the range (0, 0.5].
+    novelty : bool (default=False)
+        By default, LocalOutlierFactor is only meant to be used for outlier
+        detection (``novelty=False``), and only ``fit_predict`` is available.
+        Set to True to use it for novelty detection. In that case ``predict``,
+        ``decision_function`` and ``score_samples`` should only be used on
+        new unseen data and not on the training set.
+    n_jobs : int (default = None)
+        Ignored, here for scikit-learn API compatibility.
     verbose : int or boolean, default=False
-        Sets logging level.
-    output_type : {'input', 'array', 'dataframe', 'series', 'df_obj', \
-        'numba', 'cupy', 'numpy', 'cudf', 'pandas'}, default=None
-        Return type of array outputs.
+        Sets logging level. It must be one of `cuml.common.logger.level_*`.
+        See :ref:`verbosity-levels` for more info.
+    output_type : {None, 'input', 'cupy', 'numpy', 'cudf', 'pandas'}, default=None
+        Return results and set estimator attributes to the indicated output
+        type. If None, the output type set at the module level
+        (`cuml.global_settings.output_type`) will be used. See
+        :ref:`output-data-type-configuration` for more info.
 
     Attributes
     ----------
     negative_outlier_factor_ : array of shape (n_samples,)
-        The opposite of the local outlier factor of the training samples.
-        The lower, the more abnormal.
+        The opposite LOF of the training samples. The higher, the more
+        normal. Inliers tend to have a score close to -1, while outliers tend
+        to have a lower score.
     n_neighbors_ : int
-        The effective number of neighbors used.
+        The actual number of neighbors used for the neighbor queries.
     offset_ : float
-        Threshold on ``negative_outlier_factor_`` separating inliers from
+        Offset used to obtain binary labels from the raw scores. Samples with
+        a ``negative_outlier_factor_`` below ``offset_`` are detected as
         outliers.
-    n_samples_fit_ : int
-        Number of samples in the fitted data.
     effective_metric_ : str
-        The metric used for the neighbor search.
+        The effective metric used for the distance computation.
+    n_samples_fit_ : int
+        The number of samples in the fitted data.
+    n_features_in_ : int
+        Number of features seen during `fit`.
+
+    Examples
+    --------
+
+    .. code-block:: python
+
+        >>> import cupy as cp
+        >>> from cuml.neighbors import LocalOutlierFactor
+
+        >>> X = cp.array([[-1.1], [0.2], [101.1], [0.3]], dtype=cp.float32)
+        >>> lof = LocalOutlierFactor(n_neighbors=2)
+        >>> lof.fit_predict(X)
+        array([ 1,  1, -1,  1])
 
     Notes
     -----
-    When several training points are equidistant from a query, the selected
-    neighbor set can differ from scikit-learn's, which may shift the factor
-    of the affected points. This is inherent to nearest-neighbor ties and
-    is bounded by the distance ties themselves.
+    The neighbor search runs in single precision, also for float64 inputs,
+    and the scores are returned as float32. With the euclidean metric the
+    distances come from the expanded form of the distance, which loses
+    accuracy when the samples are far from the origin compared to the
+    distances between them. On such data the neighbors, and so the scores,
+    can differ from scikit-learn. Centering the features before fitting
+    reduces this effect.
+
+    When several training samples are at the same distance from a query,
+    the selected neighbors can differ from scikit-learn, which changes the
+    score of the samples around the tie.
+
+    For additional docs, see `scikitlearn's LocalOutlierFactor
+    <https://scikit-learn.org/stable/modules/generated/sklearn.neighbors.LocalOutlierFactor.html>`_.
     """
 
     negative_outlier_factor_ = ReflectedAttr()
 
-    _cpu_estimator_import_path = "sklearn.neighbors.LocalOutlierFactor"
+    _cpu_class_path = "sklearn.neighbors.LocalOutlierFactor"
 
     @classmethod
     def _get_param_names(cls):
-        return super()._get_param_names() + [
-            "n_neighbors",
-            "metric",
-            "p",
-            "contamination",
-            "novelty",
-        ]
+        return [*super()._get_param_names(), "contamination", "novelty"]
+
+    @classmethod
+    def _params_from_cpu(cls, model):
+        return {
+            "contamination": model.contamination,
+            "novelty": model.novelty,
+            **super()._params_from_cpu(model),
+        }
+
+    def _params_to_cpu(self):
+        return {
+            "contamination": self.contamination,
+            "novelty": self.novelty,
+            **super()._params_to_cpu(),
+        }
+
+    def _attrs_from_cpu(self, model):
+        return {
+            "n_neighbors_": model.n_neighbors_,
+            "offset_": model.offset_,
+            "negative_outlier_factor_": cp.asarray(
+                model.negative_outlier_factor_, dtype="float32"
+            ),
+            "_distances_fit_X_": cp.asarray(
+                model._distances_fit_X_, dtype="float32"
+            ),
+            "_lrd": cp.asarray(model._lrd, dtype="float32"),
+            **super()._attrs_from_cpu(model),
+        }
+
+    def _attrs_to_cpu(self, model):
+        return {
+            "n_neighbors_": self.n_neighbors_,
+            "offset_": self.offset_,
+            "negative_outlier_factor_": cp.asnumpy(
+                self.negative_outlier_factor_
+            ),
+            "_distances_fit_X_": cp.asnumpy(self._distances_fit_X_),
+            "_lrd": cp.asnumpy(self._lrd),
+            **super()._attrs_to_cpu(model),
+        }
 
     def __init__(
         self,
         *,
         n_neighbors=20,
+        algorithm="auto",
         metric="euclidean",
         p=2,
+        algo_params=None,
+        metric_params=None,
         contamination="auto",
         novelty=False,
+        n_jobs=None,  # Ignored, here for sklearn API compatibility
         verbose=False,
         output_type=None,
     ):
-        super().__init__(verbose=verbose, output_type=output_type)
-        self.n_neighbors = n_neighbors
-        self.metric = metric
-        self.p = p
+        super().__init__(
+            n_neighbors=n_neighbors,
+            algorithm=algorithm,
+            metric=metric,
+            p=p,
+            algo_params=algo_params,
+            metric_params=metric_params,
+            n_jobs=n_jobs,
+            verbose=verbose,
+            output_type=output_type,
+        )
         self.contamination = contamination
         self.novelty = novelty
 
-    def _check_novelty(self, method, expected):
-        if bool(self.novelty) != expected:
-            state = "novelty=True" if expected else "novelty=False"
-            raise AttributeError(
-                f"{method} is only available when {state}. Set the novelty "
-                "parameter accordingly before calling fit."
-            )
-
     @mlfunc(set_input_type=True)
     def fit(self, X, y=None) -> "LocalOutlierFactor":
-        """Fit the local outlier factor detector from the training data.
+        """
+        Fit the local outlier factor detector from the training dataset.
 
         Parameters
         ----------
-        X : array-like of shape (n_samples, n_features)
+        X : array-like or sparse matrix of shape (n_samples, n_features)
             Training data.
         y : Ignored
             Not used, present for API consistency.
@@ -133,135 +229,154 @@ class LocalOutlierFactor(Base):
         Returns
         -------
         self : LocalOutlierFactor
-            The fitted estimator.
+            The fitted local outlier factor detector.
         """
-        if isinstance(self.contamination, str):
-            if self.contamination != "auto":
-                raise ValueError(
-                    "contamination must be 'auto' or a float in (0, 0.5]."
-                )
-        elif not 0.0 < float(self.contamination) <= 0.5:
+        if self.contamination != "auto" and not (
+            isinstance(self.contamination, Real)
+            and 0.0 < self.contamination <= 0.5
+        ):
             raise ValueError(
-                "contamination must be 'auto' or a float in (0, 0.5]."
+                "contamination must be 'auto' or a float in the range "
+                "(0, 0.5]."
             )
-        if int(self.n_neighbors) < 1:
-            raise ValueError("n_neighbors must be a positive integer.")
 
-        X_m = check_inputs(
-            self,
-            X,
-            dtype=("float32", "float64"),
-            reset=True,
-        )
-        n_samples = X_m.shape[0]
+        super().fit(X)
+
+        n_samples = self.n_samples_fit_
         if n_samples < 2:
             raise ValueError(
-                "LocalOutlierFactor requires at least 2 training samples."
+                "LocalOutlierFactor needs at least 2 samples, got "
+                f"n_samples = {n_samples}."
             )
-        self.n_samples_fit_ = n_samples
-        self.n_neighbors_ = min(int(self.n_neighbors), n_samples - 1)
-        self.effective_metric_ = self.metric
+        if self.n_neighbors > n_samples:
+            warnings.warn(
+                f"n_neighbors ({self.n_neighbors}) is greater than the "
+                f"total number of samples ({n_samples}). n_neighbors will be "
+                "set to (n_samples - 1) for estimation."
+            )
+        self.n_neighbors_ = min(self.n_neighbors, n_samples - 1)
 
-        nn = NearestNeighbors(
-            n_neighbors=self.n_neighbors_ + 1,
-            metric=self.metric,
-            p=self.p,
-            output_type="cupy",
-        ).fit(X_m)
-        dist, idx = nn.kneighbors(
-            X_m, self.n_neighbors_ + 1, return_distance=True
+        distances, indices = self.kneighbors(n_neighbors=self.n_neighbors_)
+        self._distances_fit_X_ = distances
+        self._lrd = self._local_reachability_density(distances, indices)
+        self.negative_outlier_factor_ = -cp.mean(
+            self._lrd[indices] / self._lrd[:, None], axis=1
         )
 
-        # Drop each sample from its own neighborhood. The sample usually
-        # comes back first at distance zero, but under exact duplicates it
-        # can sit anywhere in the tied block, or be pushed out entirely.
-        k = self.n_neighbors_
-        rows = cp.arange(n_samples)
-        self_pos = idx == rows[:, None]
-        has_self = self_pos.any(axis=1)
-        drop = cp.where(has_self, self_pos.argmax(axis=1), k)
-        keep = cp.ones_like(self_pos, dtype=cp.bool_)
-        keep[rows, drop] = False
-        dist = dist[keep].reshape(n_samples, k)
-        idx = idx[keep].reshape(n_samples, k)
-
-        k_dist = dist[:, -1]
-        reach = cp.maximum(k_dist[idx], dist)
-        lrd = 1.0 / (reach.mean(axis=1) + _LRD_EPS)
-        nof = -(lrd[idx].mean(axis=1) / lrd)
-
-        self._nn = nn
-        self._distances_fit_X_ = dist
-        self._k_dist_fit_ = k_dist
-        self._lrd = lrd
-        self.negative_outlier_factor_ = nof
-
-        if isinstance(self.contamination, str):
+        if self.contamination == "auto":
+            # Inliers score around -1, the higher the less abnormal
             self.offset_ = -1.5
         else:
             self.offset_ = float(
-                cp.percentile(nof, 100.0 * float(self.contamination))
+                cp.percentile(
+                    self.negative_outlier_factor_, 100.0 * self.contamination
+                )
             )
+
+        if not self.novelty and self.negative_outlier_factor_.min() < -1e7:
+            warnings.warn(
+                "Duplicate values are leading to incorrect results. "
+                "Increase the number of neighbors for more accurate results."
+            )
+
         return self
 
-    @mlfunc(set_input_type=True)
+    def _local_reachability_density(self, distances, indices):
+        """The inverse of the mean reachability distance to the neighbors."""
+        k_distances = self._distances_fit_X_[indices, self.n_neighbors_ - 1]
+        reach_distances = cp.maximum(distances, k_distances)
+        # 1e-10 avoids `nan` when there are more than n_neighbors_ duplicates
+        return 1.0 / (cp.mean(reach_distances, axis=1) + 1e-10)
+
+    @available_if(_novelty_disabled)
+    @mlfunc(preserve_index=True)
     def fit_predict(self, X, y=None):
-        """Fit the detector and return training-sample labels.
+        """
+        Fit the model to the training set X and return the labels.
 
         Only available when ``novelty=False``.
 
+        Parameters
+        ----------
+        X : array-like or sparse matrix of shape (n_samples, n_features)
+            Training data.
+        y : Ignored
+            Not used, present for API consistency.
+
         Returns
         -------
         labels : array of shape (n_samples,)
             1 for inliers, -1 for outliers.
         """
-        self._check_novelty("fit_predict", expected=False)
         self.fit(X)
-        labels = cp.where(
-            self.negative_outlier_factor_ < self.offset_, -1, 1
-        ).astype(cp.int64)
-        return labels
+        return cp.where(self.negative_outlier_factor_ < self.offset_, -1, 1)
 
-    def _score_samples(self, X):
-        check_is_fitted(self)
-        X_m = check_inputs(
-            self,
-            X,
-            dtype=("float32", "float64"),
-            reset=False,
-        )
-        dist, idx = self._nn.kneighbors(
-            X_m, self.n_neighbors_, return_distance=True
-        )
-        reach = cp.maximum(self._k_dist_fit_[idx], dist)
-        lrd_x = 1.0 / (reach.mean(axis=1) + _LRD_EPS)
-        return -(self._lrd[idx].mean(axis=1) / lrd_x)
-
-    @mlfunc
+    @available_if(_novelty_enabled)
+    @mlfunc(preserve_index=True)
     def score_samples(self, X):
-        """Opposite of the local outlier factor of X (novelty mode only).
-
-        The lower, the more abnormal.
         """
-        self._check_novelty("score_samples", expected=True)
-        return self._score_samples(X)
+        Opposite of the Local Outlier Factor of X.
 
-    @mlfunc
+        Only available when ``novelty=True``. The argument X is supposed to
+        contain new data: the samples in X are not considered in the
+        neighborhood of any point, so the scores of the training samples are
+        available through ``negative_outlier_factor_`` instead.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix of shape (n_samples, n_features)
+            The query samples.
+
+        Returns
+        -------
+        scores : array of shape (n_samples,)
+            The opposite of the Local Outlier Factor of each sample. The
+            lower, the more abnormal.
+        """
+        check_is_fitted(self)
+        distances, indices = self.kneighbors(X, n_neighbors=self.n_neighbors_)
+        lrd = self._local_reachability_density(distances, indices)
+        return -cp.mean(self._lrd[indices] / lrd[:, None], axis=1)
+
+    @available_if(_novelty_enabled)
+    @mlfunc(preserve_index=True)
     def decision_function(self, X):
-        """Shifted opposite of the local outlier factor of X (novelty mode
-        only). Negative values are outliers."""
-        self._check_novelty("decision_function", expected=True)
-        return self._score_samples(X) - self.offset_
+        """
+        Shifted opposite of the Local Outlier Factor of X.
 
-    @mlfunc
+        Only available when ``novelty=True``. The shift offset allows a zero
+        threshold for being an outlier.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix of shape (n_samples, n_features)
+            The query samples.
+
+        Returns
+        -------
+        scores : array of shape (n_samples,)
+            The shifted opposite of the Local Outlier Factor of each sample.
+            Negative scores represent outliers, positive scores represent
+            inliers.
+        """
+        return self.score_samples(X) - self.offset_
+
+    @available_if(_novelty_enabled)
+    @mlfunc(preserve_index=True)
     def predict(self, X):
-        """Predict labels of X (novelty mode only).
+        """
+        Predict the labels (1 inlier, -1 outlier) of X according to LOF.
+
+        Only available when ``novelty=True``.
+
+        Parameters
+        ----------
+        X : array-like or sparse matrix of shape (n_samples, n_features)
+            The query samples.
 
         Returns
         -------
         labels : array of shape (n_samples,)
             1 for inliers, -1 for outliers.
         """
-        self._check_novelty("predict", expected=True)
-        scores = self._score_samples(X) - self.offset_
-        return cp.where(scores < 0, -1, 1).astype(cp.int64)
+        return cp.where(self.score_samples(X) < self.offset_, -1, 1)
