@@ -5,6 +5,7 @@
 import pickle
 
 import cudf
+import cudf.pandas
 import cupy as cp
 import numpy as np
 import pandas as pd
@@ -166,7 +167,10 @@ def test_output_types(outlier_data, query_data):
     assert isinstance(model.negative_outlier_factor_, cudf.Series)
     labels = cuLocalOutlierFactor().fit_predict(X)
     assert isinstance(labels, cudf.Series)
-    assert labels.index.to_pandas().equals(index)
+    expected_index = (
+        index.as_cpu_object() if cudf.pandas.is_proxy_object(index) else index
+    )
+    assert labels.index.to_pandas().equals(expected_index)
 
     index = pd.RangeIndex(100, 100 + len(query_data))
     Q = pd.DataFrame(query_data, index=index)
